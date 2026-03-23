@@ -15,7 +15,6 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.data_models import Train, Station, DelayInjection, ScenarioType
 from models.data_loader import get_trains_pydantic, get_stations_pydantic, get_station_codes, get_station_names, get_train_ids
 from solver.mip_scheduler import MIPScheduler
-from agent.planner_agent import PlannerAgent
 from skills.dispatch_skills import create_skills, execute_skill
 from evaluation.evaluator import Evaluator
 
@@ -30,6 +29,10 @@ sys.path.insert(0, project_root)
 # 导入运行图生成模块（经典铁路运行图风格：横轴时间，纵轴车站）
 from visualization.simple_diagram import create_train_diagram, create_comparison_diagram
 
+# 导入Qwen Agent
+from qwen.qwen_agent import QwenAgent, create_qwen_agent
+from qwen.tool_registry import ToolRegistry
+
 app = Flask(__name__)
 
 # 全局数据 - 从 centralized data loader 加载
@@ -42,8 +45,24 @@ train_ids = get_train_ids()
 # 创建调度器
 scheduler = MIPScheduler(trains, stations)
 skills = create_skills(scheduler)
-planner = PlannerAgent()
 evaluator = Evaluator()
+
+# Qwen Agent (延迟加载)
+qwen_agent = None
+USE_QWEN_AGENT = True  # 设置为False可禁用Qwen Agent
+
+def get_qwen_agent():
+    """获取或创建Qwen Agent实例"""
+    global qwen_agent
+    if qwen_agent is None and USE_QWEN_AGENT:
+        try:
+            print("正在初始化Qwen Agent...")
+            qwen_agent = create_qwen_agent(trains=trains, stations=stations)
+            print("Qwen Agent 初始化完成")
+        except Exception as e:
+            print(f"Qwen Agent 初始化失败: {e}")
+            return None
+    return qwen_agent
 
 
 def get_original_schedule():
@@ -276,261 +295,244 @@ HTML_TEMPLATE = '''
     <div class="container">
         <!-- 标签页 -->
         <div class="tabs">
-            <button class="tab active" onclick="showTab('input')">📝 延误注入</button>
-            <button class="tab" onclick="showTab('result')">📊 调度结果</button>
-            <button class="tab" onclick="showTab('diagram')">📈 运行图</button>
+            <button class="tab active" onclick="showTab('dispatch')">🤖 智能调度</button>
         </div>
-        
-        <!-- 延误注入 -->
-        <div id="input" class="tab-content active">
+
+        <!-- 智能调度 - 统一入口 -->
+        <div id="dispatch" class="tab-content active">
+            <!-- 输入区域 -->
             <div class="card">
-                <h2>场景配置</h2>
-                <div class="grid-2">
+                <h2>📝 输入调度需求</h2>
+
+                <!-- 智能对话输入 -->
+                <div style="margin-bottom: 20px;">
+                    <h3 style="color: #1565C0; margin-bottom: 10px;">💬 智能对话输入</h3>
+                    <p style="color: #666; font-size: 0.9em; margin-bottom: 10px;">用自然语言描述您的需求，如"G1001在天津西延误10分钟"</p>
+                    <div class="grid" style="margin-bottom: 10px;">
+                        <button class="btn" style="background: #e3f2fd; color: #1565C0;" onclick="fillPrompt('限速')">🚄 临时限速</button>
+                        <button class="btn" style="background: #ffebee; color: #c62828;" onclick="fillPrompt('故障')">🚨 突发故障</button>
+                        <button class="btn" style="background: #f3e5f5; color: #7b1fa2;" onclick="fillPrompt('延误')">📋 延误调整</button>
+                    </div>
+                    <textarea id="dispatchPrompt" rows="3" placeholder="描述您的调度需求..."></textarea>
+                    <button class="btn btn-primary" onclick="sendDispatch()" style="margin-top: 10px;">🚀 开始智能调度</button>
+                </div>
+
+                <div style="border-top: 1px dashed #ddd; padding-top: 20px;">
+                    <h3 style="color: #666; margin-bottom: 10px; cursor: pointer;" onclick="toggleFormInput()">
+                        📋 表单输入 <span id="formToggleIcon" style="font-size: 0.8em;">▼ 点击展开</span>
+                    </h3>
+                    <div id="formInputSection" style="display: none;">
+                    <div class="grid-2">
+                        <div class="form-group">
+                            <label>场景类型</label>
+                            <select id="scenarioType">
+                                <option value="temporary_speed_limit">临时限速</option>
+                                <option value="sudden_failure">突发故障</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>优化目标</label>
+                            <select id="objective">
+                                <option value="min_max_delay">最小化最大延误</option>
+                                <option value="min_avg_delay">最小化平均延误</option>
+                            </select>
+                        </div>
+                    </div>
+
                     <div class="form-group">
-                        <label>场景类型</label>
-                        <select id="scenarioType">
-                            <option value="temporary_speed_limit">临时限速</option>
-                            <option value="sudden_failure">突发故障</option>
+                        <label>选择列车</label>
+                        <select id="selectedTrains" multiple style="height: 80px;">
+                            {% for train_id in train_ids %}
+                            <option value="{{ train_id }}">{{ train_id }}</option>
+                            {% endfor %}
                         </select>
                     </div>
-                    <div class="form-group">
-                        <label>优化目标</label>
-                        <select id="objective">
-                            <option value="min_max_delay">最小化最大延误</option>
-                            <option value="min_avg_delay">最小化平均延误</option>
-                        </select>
-                    </div>
-                </div>
-                
-                <div id="speedLimitParams" class="grid-2">
-                    <div class="form-group">
-                        <label>限速值 (km/h)</label>
-                        <input type="number" id="limitSpeed" value="200" min="50" max="350">
-                    </div>
-                    <div class="form-group">
-                        <label>持续时间 (分钟)</label>
-                        <input type="number" id="duration" value="120" min="10" max="480">
-                    </div>
-                </div>
-            </div>
-            
-            <div class="card">
-                <h2>选择受影响列车</h2>
-                <div class="form-group">
-                    <label>列车选择（可多选）</label>
-                    <select id="selectedTrains" multiple style="height: 120px;">
-                        {% for train_id in train_ids %}
-                        <option value="{{ train_id }}">{{ train_id }}</option>
-                        {% endfor %}
-                    </select>
-                </div>
-            </div>
-            
-            <div class="card">
-                <h2>延误配置</h2>
-                <div id="delayConfig">
-                    <div class="delay-row grid-2">
+
+                    <div class="grid-2">
                         <div class="form-group">
                             <label>延误车站</label>
-                            <select class="delay-station">
+                            <select id="delayStation">
                                 {% for code, name in station_names.items() %}
                                 <option value="{{ code }}">{{ name }}</option>
                                 {% endfor %}
                             </select>
                         </div>
                         <div class="form-group">
-                            <label>延误时间 (秒)</label>
-                            <input type="number" class="delay-seconds" value="600" min="60" max="7200" step="60">
+                            <label>延误时间(秒)</label>
+                            <input type="number" id="delaySeconds" value="600" min="60" max="7200">
                         </div>
                     </div>
+
+                    <button class="btn btn-success" onclick="runFormDispatch()" style="width: 100%;">🚀 执行调度</button>
+                    </div>
                 </div>
-                <button class="btn btn-primary" onclick="addDelayRow()" style="margin-top: 10px;">+ 添加延误</button>
-            </div>
-            
-            <button class="btn btn-success" onclick="runDispatch()" style="width: 100%;">🚀 开始调度</button>
-            
-            <div class="loading" id="loading">
+
+            <!-- 加载状态 -->
+            <div class="loading" id="dispatchLoading">
                 <div class="spinner"></div>
-                <p>调度优化中，请稍候...</p>
+                <p>Agent正在分析场景、执行调度...</p>
             </div>
-        </div>
-        
-        <!-- 调度结果 -->
-        <div id="result" class="tab-content">
-            <div id="resultContent">
+
+            <!-- 结果展示 -->
+            <div id="dispatchResult" style="display: none;">
+                <!-- 分析结果 -->
                 <div class="card">
-                    <h2>📋 Planner分析结果</h2>
-                    <div class="grid" id="plannerResult">
+                    <h2>📊 分析结果</h2>
+                    <div class="grid">
                         <div class="metric">
-                            <div class="metric-value" id="scenarioTypeResult">-</div>
+                            <div class="metric-value" id="resultScenario">-</div>
                             <div class="metric-label">场景类型</div>
                         </div>
                         <div class="metric">
-                            <div class="metric-value" id="delayLevelResult">-</div>
-                            <div class="metric-label">延误等级</div>
+                            <div class="metric-value" id="resultSkill">-</div>
+                            <div class="metric-label">使用技能</div>
                         </div>
                         <div class="metric">
-                            <div class="metric-value" id="confidenceResult">-</div>
-                            <div class="metric-label">置信度</div>
-                        </div>
-                    </div>
-                </div>
-                
-                <div class="card">
-                    <h2>📊 调度结果统计</h2>
-                    <div class="grid">
-                        <div class="metric">
-                            <div class="metric-value" id="maxDelayResult">-</div>
-                            <div class="metric-label">最大延误</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value" id="avgDelayResult">-</div>
-                            <div class="metric-label">平均延误</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value" id="totalDelayResult">-</div>
-                            <div class="metric-label">总延误</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value" id="computeTimeResult">-</div>
+                            <div class="metric-value" id="resultTime">-</div>
                             <div class="metric-label">计算时间</div>
                         </div>
                     </div>
-                </div>
-                
-                <div class="card">
-                    <h2>📈 评估对比</h2>
-                    <div class="comparison">
-                        <div class="comparison-item">
-                            <h4>优化方案</h4>
-                            <div class="metric">
-                                <div class="metric-value" id="optMaxDelay">-</div>
-                                <div class="metric-label">最大延误</div>
-                            </div>
+
+                    <h4 style="margin: 15px 0 10px;">🤔 Agent推理过程</h4>
+                    <div id="resultReasoning" style="background: #f5f5f5; padding: 15px; border-radius: 5px; max-height: 150px; overflow-y: auto; white-space: pre-wrap;"></div>
+
+                    <h4 style="margin: 15px 0 10px;">📈 延误统计</h4>
+                    <div class="grid">
+                        <div class="metric">
+                            <div class="metric-value" id="resultMaxDelay">-</div>
+                            <div class="metric-label">最大延误</div>
                         </div>
-                        <div class="comparison-item">
-                            <h4>基线方案（不调整）</h4>
-                            <div class="metric">
-                                <div class="metric-value" id="baseMaxDelay">-</div>
-                                <div class="metric-label">最大延误</div>
-                            </div>
+                        <div class="metric">
+                            <div class="metric-value" id="resultAvgDelay">-</div>
+                            <div class="metric-label">平均延误</div>
                         </div>
-                    </div>
-                    <div class="comparison">
-                        <div class="comparison-item">
-                            <div class="metric">
-                                <div class="metric-value" id="optAvgDelay">-</div>
-                                <div class="metric-label">平均延误</div>
-                            </div>
-                        </div>
-                        <div class="comparison-item">
-                            <div class="metric">
-                                <div class="metric-value" id="baseAvgDelay">-</div>
-                                <div class="metric-label">平均延误</div>
-                            </div>
+                        <div class="metric">
+                            <div class="metric-value" id="resultTotalDelay">-</div>
+                            <div class="metric-label">总延误</div>
                         </div>
                     </div>
+
+                    <div id="resultMessage" style="background: #e8f5e9; padding: 12px; border-radius: 5px; margin-top: 15px;"></div>
                 </div>
-                
+
+                <!-- 时刻表 -->
                 <div class="card">
                     <h2>📅 优化后时刻表</h2>
-                    <div id="scheduleTable"></div>
+                    <div id="scheduleTable" style="overflow-x: auto;"></div>
                 </div>
-            </div>
-            
-            <div id="noResult" style="text-align: center; padding: 60px; color: #888;">
-                <p>请先在【延误注入】标签页配置场景并执行调度</p>
-            </div>
-        </div>
-        
-        <!-- 运行图 -->
-        <div id="diagram" class="tab-content">
-            <div id="diagramContent">
+
+                <!-- 运行图 -->
                 <div class="card">
-                    <h2>📈 列车运行图对比</h2>
-                    <div id="diagramContainer"></div>
+                    <h2>📈 运行图对比</h2>
+                    <div id="diagramContainer" style="text-align: center;"></div>
                 </div>
-            </div>
-            <div id="noDiagram" style="text-align: center; padding: 60px; color: #888;">
-                <p>请先执行调度生成运行图</p>
             </div>
         </div>
     </div>
-    
+
     <footer>
         <p>铁路调度Agent系统 v1.0 | 基于整数规划优化</p>
     </footer>
-    
+
     <script>
-        // 全局数据
-        let dispatchResult = null;
-        
+        // 切换表单输入显示
+        function toggleFormInput() {
+            const section = document.getElementById('formInputSection');
+            const icon = document.getElementById('formToggleIcon');
+            if (section.style.display === 'none') {
+                section.style.display = 'block';
+                icon.textContent = '▲ 点击收起';
+            } else {
+                section.style.display = 'none';
+                icon.textContent = '▼ 点击展开';
+            }
+        }
+
         // 标签页切换
         function showTab(tabId) {
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            // 找到对应tabId的按钮并添加active类
-            const tabs = document.querySelectorAll('.tab');
-            if (tabId === 'input') tabs[0].classList.add('active');
-            else if (tabId === 'result') tabs[1].classList.add('active');
-            else if (tabId === 'diagram') tabs[2].classList.add('active');
-            document.getElementById(tabId).classList.add('active');
+            document.querySelector('.tab').classList.add('active');
+            document.getElementById('dispatch').classList.add('active');
         }
-        
-        // 添加延误行
-        function addDelayRow() {
-            const config = document.getElementById('delayConfig');
-            const stations = {{ station_names|tojson }};
-            let html = '<div class="delay-row grid-2">';
-            html += '<div class="form-group"><label>延误车站</label><select class="delay-station">';
-            for (let [code, name] of Object.entries(stations)) {
-                html += '<option value="' + code + '">' + name + '</option>';
+
+        // 填充快速输入
+        function fillPrompt(type) {
+            const prompts = {
+                '限速': 'G1001和G1003列车在天津西站因临时限速延误10分钟和15分钟',
+                '故障': 'G1005列车在天津西站发生设备故障，延误40分钟',
+                '延误': 'G1001列车在北京西站发车延误5分钟，需要调整'
+            };
+            document.getElementById('dispatchPrompt').value = prompts[type] || '';
+        }
+
+        // 格式化时间
+        function formatTime(seconds) {
+            if (seconds === undefined || seconds === null) return '-';
+            const mins = Math.floor(seconds / 60);
+            const secs = Math.round(seconds % 60);
+            return mins + '分' + secs + '秒';
+        }
+
+        // 发送智能调度（对话模式）
+        function sendDispatch() {
+            const prompt = document.getElementById('dispatchPrompt').value.trim();
+            if (!prompt) {
+                alert('请输入调度需求');
+                return;
             }
-            html += '</select></div>';
-            html += '<div class="form-group"><label>延误时间 (秒)</label><input type="number" class="delay-seconds" value="600" min="60" max="7200" step="60"></div>';
-            html += '</div>';
-            config.insertAdjacentHTML('beforeend', html);
+
+            document.getElementById('dispatchLoading').style.display = 'block';
+            document.getElementById('dispatchResult').style.display = 'none';
+
+            fetch('/api/agent_chat', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({prompt: prompt})
+            })
+            .then(response => response.json())
+            .then(result => {
+                document.getElementById('dispatchLoading').style.display = 'none';
+
+                if (result.success) {
+                    showDispatchResult(result);
+                } else {
+                    alert('执行失败: ' + result.message);
+                }
+            })
+            .catch(error => {
+                document.getElementById('dispatchLoading').style.display = 'none';
+                alert('请求失败: ' + error);
+            });
         }
-        
-        // 运行调度
-        function runDispatch() {
-            // 获取选择
+
+        // 发送表单调度
+        function runFormDispatch() {
             const selectedTrains = Array.from(document.getElementById('selectedTrains').selectedOptions).map(o => o.value);
             if (selectedTrains.length === 0) {
                 alert('请至少选择一列列车');
                 return;
             }
-            
-            // 获取延误配置
-            const delayRows = document.querySelectorAll('.delay-row');
-            const delayConfig = [];
-            delayRows.forEach((row, index) => {
-                if (index < selectedTrains.length) {
-                    delayConfig.push({
-                        train_id: selectedTrains[index],
-                        delay_seconds: parseInt(row.querySelector('.delay-seconds').value),
-                        station_code: row.querySelector('.delay-station').value
-                    });
-                }
-            });
-            
-            // 构建请求数据
+
             const scenarioType = document.getElementById('scenarioType').value;
             const objective = document.getElementById('objective').value;
-            
+            const delayStation = document.getElementById('delayStation').value;
+            const delaySeconds = parseInt(document.getElementById('delaySeconds').value);
+
             const data = {
                 scenario_type: scenarioType,
                 objective: objective,
                 selected_trains: selectedTrains,
-                delay_config: delayConfig,
-                limit_speed: parseInt(document.getElementById('limitSpeed').value),
-                duration: parseInt(document.getElementById('duration').value)
+                delay_config: [{
+                    train_id: selectedTrains[0],
+                    delay_seconds: delaySeconds,
+                    station_code: delayStation
+                }]
             };
-            
-            // 显示加载
-            document.getElementById('loading').style.display = 'block';
-            
-            // 发送请求
+
+            document.getElementById('dispatchLoading').style.display = 'block';
+            document.getElementById('dispatchResult').style.display = 'none';
+
             fetch('/api/dispatch', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -538,278 +540,85 @@ HTML_TEMPLATE = '''
             })
             .then(response => response.json())
             .then(result => {
-                document.getElementById('loading').style.display = 'none';
-                
+                document.getElementById('dispatchLoading').style.display = 'none';
+
                 if (result.success) {
-                    dispatchResult = result;
-                    showResult(result);
-                    showDiagram(result);
-                    showTab('result');
+                    // 转换为统一格式
+                    const unified = {
+                        success: true,
+                        recognized_scenario: result.planner.recognized_scenario,
+                        selected_skill: result.skill_result.message.includes('限速') ? 'temporary_speed_limit_skill' : 'sudden_failure_skill',
+                        reasoning: '基于表单输入执行调度优化',
+                        delay_statistics: result.skill_result.delay_statistics,
+                        message: result.skill_result.message,
+                        computation_time: result.skill_result.computation_time,
+                        optimized_schedule: result.skill_result.optimized_schedule,
+                        original_schedule: result.original_schedule
+                    };
+                    showDispatchResult(unified);
                 } else {
-                    alert('调度失败: ' + result.message);
+                    alert('执行失败: ' + result.message);
                 }
             })
             .catch(error => {
-                document.getElementById('loading').style.display = 'none';
+                document.getElementById('dispatchLoading').style.display = 'none';
                 alert('请求失败: ' + error);
             });
         }
-        
-        // 显示结果
-        function showResult(result) {
-            document.getElementById('noResult').style.display = 'none';
-            document.getElementById('resultContent').style.display = 'block';
-            
-            // Planner结果
-            document.getElementById('scenarioTypeResult').textContent = result.planner.recognized_scenario;
-            document.getElementById('delayLevelResult').textContent = result.planner.delay_level;
-            document.getElementById('confidenceResult').textContent = (result.planner.confidence * 100).toFixed(0) + '%';
-            
-            // 调度统计
-            const stats = result.skill_result.delay_statistics;
-            document.getElementById('maxDelayResult').textContent = formatTime(stats.max_delay_seconds);
-            document.getElementById('avgDelayResult').textContent = formatTime(stats.avg_delay_seconds);
-            document.getElementById('totalDelayResult').textContent = formatTime(stats.total_delay_seconds);
-            document.getElementById('computeTimeResult').textContent = result.skill_result.computation_time.toFixed(2) + 's';
-            
-            // 评估对比
-            const evalResult = result.eval_result;
-            document.getElementById('optMaxDelay').textContent = formatTime(evalResult.proposed_metrics.max_delay_seconds);
-            document.getElementById('baseMaxDelay').textContent = formatTime(evalResult.baseline_metrics.max_delay_seconds);
-            document.getElementById('optAvgDelay').textContent = formatTime(evalResult.proposed_metrics.avg_delay_seconds);
-            document.getElementById('baseAvgDelay').textContent = formatTime(evalResult.baseline_metrics.avg_delay_seconds);
-            
+
+        // 显示调度结果
+        function showDispatchResult(result) {
+            document.getElementById('dispatchResult').style.display = 'block';
+
+            // 基本信息
+            document.getElementById('resultScenario').textContent = result.recognized_scenario || '-';
+            document.getElementById('resultSkill').textContent = result.selected_skill || '-';
+            document.getElementById('resultTime').textContent = (result.computation_time || 0).toFixed(2) + 's';
+
+            // 推理过程
+            document.getElementById('resultReasoning').textContent = result.reasoning || '-';
+
+            // 延误统计
+            const stats = result.delay_statistics || {};
+            document.getElementById('resultMaxDelay').textContent = formatTime(stats.max_delay_seconds);
+            document.getElementById('resultAvgDelay').textContent = formatTime(stats.avg_delay_seconds);
+            document.getElementById('resultTotalDelay').textContent = formatTime(stats.total_delay_seconds);
+
+            // 消息
+            document.getElementById('resultMessage').textContent = result.message || '-';
+
             // 时刻表
             let tableHtml = '<table class="schedule-table"><thead><tr><th>车次</th><th>车站</th><th>到达</th><th>发车</th><th>延误</th></tr></thead><tbody>';
-            for (let [trainId, stops] of Object.entries(result.skill_result.optimized_schedule)) {
+            for (let [trainId, stops] of Object.entries(result.optimized_schedule || {})) {
                 for (let stop of stops) {
-                    const delay = stop.delay_seconds;
+                    const delay = stop.delay_seconds || 0;
                     const delayClass = delay > 0 ? 'delay-red' : 'delay-green';
                     const delayText = delay > 0 ? '+' + delay + '秒' : '准点';
-                    tableHtml += '<tr><td>' + trainId + '</td><td>' + stop.station_name + '</td><td>' + stop.arrival_time + '</td><td>' + stop.departure_time + '</td><td><span class="delay-tag ' + delayClass + '">' + delayText + '</span></td></tr>';
+                    tableHtml += '<tr><td>' + trainId + '</td><td>' + (stop.station_name || stop.station_code) + '</td><td>' + stop.arrival_time + '</td><td>' + stop.departure_time + '</td><td><span class="delay-tag ' + delayClass + '">' + delayText + '</span></td></tr>';
                 }
             }
             tableHtml += '</tbody></table>';
             document.getElementById('scheduleTable').innerHTML = tableHtml;
-        }
 
-        // 显示运行图（调用后端API生成）
-        function showDiagram(result) {
-            document.getElementById('noDiagram').style.display = 'none';
-            document.getElementById('diagramContent').style.display = 'block';
-
-            const original = result.original_schedule;
-            const optimized = result.skill_result.optimized_schedule;
-
-            // 调用后端API生成运行图
-            fetch('/api/diagram', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    original_schedule: original,
-                    optimized_schedule: optimized
+            // 运行图
+            if (result.optimized_schedule && result.original_schedule) {
+                fetch('/api/diagram', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        original_schedule: result.original_schedule,
+                        optimized_schedule: result.optimized_schedule
+                    })
                 })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    // 显示后端生成的图片
-                    const html = `
-                        <div style="text-align: center;">
-                            <img src="data:image/png;base64,${data.diagram_image}"
-                                 style="max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 8px;">
-                        </div>
-                    `;
-                    document.getElementById('diagramContainer').innerHTML = html;
-                } else {
-                    document.getElementById('diagramContainer').innerHTML =
-                        '<p style="color: red; text-align: center;">运行图生成失败: ' + data.message + '</p>';
-                }
-            })
-            .catch(error => {
-                console.error('Error:', error);
-                document.getElementById('diagramContainer').innerHTML =
-                    '<p style="color: red; text-align: center;">请求失败: ' + error + '</p>';
-            });
-        }
-
-        // 保留原来的JS生成函数作为备用（现在不再使用）
-        function generateClassicDiagram(schedule, stationCodes, stationNames, timeMin, timeMax) {
-            // 拼音映射
-            const pinyinMap = {
-                "北京西": "BJP", "天津西": "TJG", "济南西": "JNZ",
-                "南京南": "NJH", "上海虹桥": "SHH"
-            };
-            
-            // 计算时间范围（对齐到10分钟）
-            const tMin = Math.floor(timeMin / 10) * 10 - 30;
-            const tMax = Math.floor(timeMax / 10) * 10 + 30;
-            
-            function timeToY(minutes) {
-                return (minutes - tMin) / (tMax - tMin) * 100;
-            }
-            
-            function stationToX(idx) {
-                return idx / (stationCodes.length - 1) * 100;
-            }
-            
-            // 生成时间刻度
-            let timeTicks = '';
-            for (let t = Math.ceil(tMin/10)*10; t <= tMax; t += 10) {
-                const y = 100 - timeToY(t);
-                const h = Math.floor(t / 60);
-                const m = t % 60;
-                timeTicks += `<div class="time-tick" style="top:${y}%;">${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}</div>`;
-            }
-            
-            // 生成车站标签
-            let stationLabels = '';
-            stationCodes.forEach((code, idx) => {
-                const x = stationToX(idx);
-                const name = stationNames[code] || code;
-                stationLabels += `<div class="station-label" style="left:${x}%;">${pinyinMap[name] || code}</div>`;
-            });
-            
-            // 生成垂直网格线（时间刻度线）
-            let vLines = '';
-            for (let t = Math.ceil(tMin/10)*10; t <= tMax; t += 10) {
-                const y = 100 - timeToY(t);
-                vLines += `<div class="grid-v" style="top:30px;bottom:30px;left:${y}%;"></div>`;
-            }
-
-            // 生成水平网格线（车站横线）
-            let hLines = '';
-            stationCodes.forEach((_, idx) => {
-                const x = stationToX(idx);
-                hLines += `<div class="grid-h" style="left:10px;right:10px;top:${x}%;"></div>`;
-            });
-
-            // 生成运行线
-            let trainLines = '';
-            const colors = ['#E91E63', '#9C27B0', '#3F51B5', '#00BCD4', '#4CAF50', '#FF9800'];
-            let trainIdx = 0;
-            
-            for (let [trainId, stops] of Object.entries(schedule)) {
-                const color = colors[trainIdx % colors.length];
-                trainIdx++;
-                
-                // 收集该列车的所有点
-                let points = [];
-                for (let stop of stops) {
-                    if (!stationCodes.includes(stop.station_code)) continue;
-                    const sIdx = stationCodes.indexOf(stop.station_code);
-                    const arrMin = timeToMinutes(stop.arrival_time);
-                    const depMin = timeToMinutes(stop.departure_time);
-                    points.push({idx: sIdx, arr: arrMin, dep: depMin, delay: stop.delay_seconds || 0});
-                }
-                
-                // 绘制运行线
-                for (let i = 0; i < points.length; i++) {
-                    const p = points[i];
-                    const x = stationToX(p.idx);
-                    const y = 100 - timeToY(p.dep);
-                    
-                    // 绘制车站点
-                    trainLines += `<div class="train-dot" style="left:${x}%;top:${y}%;background:${color};"></div>`;
-                    
-                    // 绘制到下一站的斜线
-                    if (i < points.length - 1) {
-                        const nextP = points[i + 1];
-                        const x1 = stationToX(p.idx);
-                        const y1 = 100 - timeToY(p.dep);
-                        const x2 = stationToX(nextP.idx);
-                        const y2 = 100 - timeToY(nextP.arr);
-
-                        // 计算斜线长度和角度
-                        const dx = x2 - x1;
-                        const dy = y1 - y2;
-
-                        // 基础角度（负数，表示向右下倾斜）
-                        const baseAngle = Math.atan2(dy, dx) * 180 / Math.PI;
-
-                        // 根据延误调整斜率：延误越多，斜率越接近0（越平缓），最大为0（停车）
-                        // 延误导致额外的时间，所以角度应该变大（更接近0）
-                        const delayMinutes = p.delay / 60; // 当前站的延误（分钟）
-                        const delayFactor = Math.min(delayMinutes / 60, 1); // 延误因子，最大1
-
-                        // 计算调整后的角度：基础角度向0方向调整
-                        // baseAngle是负数，向0调整意味着减去一个正数（变得更小/更接近0）
-                        // 但我们希望斜率"变大"（更接近0），所以需要反向
-                        // 实际上：dy越大（延误越多），角度应该越小（绝对值越大）
-                        // 用户说"斜率变大"，如果指的是数值变大：-1 -> -0.5
-
-                        // 重新理解：延误时，斜线应该更平缓（更接近水平）
-                        // 即角度从负值向0变化，如-45度变成-30度
-                        // 这需要将角度乘以一个小于1的正数
-                        const adjustedAngle = baseAngle * (1 - delayFactor * 0.5);
-                        // 限制角度范围：最大0（水平/停车），最小为基础角度
-                        const finalAngle = Math.max(adjustedAngle, baseAngle);
-
-                        // 计算调整后的长度（保持终点位置不变，调整角度）
-                        // 新的dy' = dx * tan(finalAngle)
-                        const newDy = dx * Math.tan(finalAngle * Math.PI / 180);
-                        const length = Math.sqrt(dx*dx + newDy*newDy);
-
-                        // 斜线从当前站发车点(x1, y1)开始
-                        trainLines += `<div class="train-slope" style="
-                            left:${x1}%;top:${y1}%;
-                            width:${length}%;transform:rotate(${finalAngle}deg);
-                            background:${color};
-                        "></div>`;
+                .then(resp => resp.json())
+                .then(data => {
+                    if (data.success) {
+                        const html = '<img src="data:image/png;base64,' + data.diagram_image + '" style="max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 8px;">';
+                        document.getElementById('diagramContainer').innerHTML = html;
                     }
-                    
-                    // 标注延误
-                    if (p.delay > 0) {
-                        const delayMin = Math.round(p.delay / 60);
-                        const x = stationToX(p.idx);
-                        const y = 100 - timeToY(p.dep);
-                        trainLines += `<div class="delay-tag" style="left:${x+2}%;top:${y-15}px;">+${delayMin}min</div>`;
-                    }
-                }
-                
-                // 标注车次
-                if (points.length > 0) {
-                    const x = stationToX(points[0].idx) - 3;
-                    const y = 100 - timeToY(points[0].dep) + 5;
-                    trainLines += `<div class="train-name" style="left:${x}%;top:${y}%;color:${color};">${trainId}</div>`;
-                }
+                });
             }
-            
-            return `
-                <div class="classic-diagram">
-                    <div class="time-axis">${timeTicks}</div>
-                    <div class="station-axis-bottom">${stationLabels}</div>
-                    <div class="grid-v-lines">${vLines}</div>
-                    <div class="grid-h-lines">${hLines}</div>
-                    <div class="train-lines">${trainLines}</div>
-                </div>
-            `;
         }
-        
-        // 辅助函数：时间转分钟
-        function timeToMinutes(timeStr) {
-            if (!timeStr) return 0;
-            const [h, m, s] = timeStr.split(':').map(Number);
-            return h * 60 + m + (s || 0);
-        }
-        
-        // 格式化时间（秒转分钟秒）
-        function formatTime(seconds) {
-            if (seconds === undefined || seconds === null) return '-';
-            const mins = Math.floor(seconds / 60);
-            const secs = Math.round(seconds % 60);
-            return mins + '分' + secs + '秒';
-        }
-        
-        // 初始化场景参数显示
-        document.getElementById('scenarioType').addEventListener('change', function() {
-            const params = document.getElementById('speedLimitParams');
-            if (this.value === 'temporary_speed_limit') {
-                params.style.display = 'grid';
-            } else {
-                params.style.display = 'none';
-            }
-        });
     </script>
 </body>
 </html>
@@ -853,11 +662,30 @@ def dispatch():
                 failure_type="vehicle_breakdown",
                 repair_time=60
             )
-        
-        # Planner分析
-        planner_output = planner.process(delay_injection)
-        
-        # 执行Skill
+
+        # 使用Qwen Agent或直接执行Skill（兜底）
+        agent = get_qwen_agent()
+        if agent:
+            # 使用Qwen Agent
+            result = agent.analyze(delay_injection.model_dump())
+            if result.success and result.dispatch_result:
+                skill_result = result.dispatch_result
+                return jsonify({
+                    "success": True,
+                    "planner": {
+                        "recognized_scenario": result.recognized_scenario,
+                        "delay_level": "0",
+                        "confidence": 0.9
+                    },
+                    "skill_result": {
+                        "optimized_schedule": skill_result.optimized_schedule,
+                        "delay_statistics": skill_result.delay_statistics,
+                        "computation_time": skill_result.computation_time
+                    },
+                    "original_schedule": get_original_schedule()
+                })
+
+        # 兜底：直接执行Skill
         skill_name = "temporary_speed_limit_skill" if scenario_type == "temporary_speed_limit" else "sudden_failure_skill"
         skill_result = execute_skill(
             skill_name=skill_name,
@@ -867,40 +695,25 @@ def dispatch():
             delay_injection=delay_injection.model_dump(),
             optimization_objective=data.get('objective', 'min_max_delay')
         )
-        
-        # 评估
+
+        # 返回结果
         original_schedule = get_original_schedule()
-        eval_result = evaluator.evaluate(
-            proposed_schedule=skill_result.optimized_schedule,
-            original_schedule=original_schedule,
-            delay_injection=delay_injection.model_dump()
-        )
-        
+
         return jsonify({
             "success": True,
             "planner": {
-                "recognized_scenario": planner_output.recognized_scenario.value,
-                "delay_level": planner_output.delay_level.value,
-                "confidence": planner_output.confidence_score
+                "recognized_scenario": scenario_type,
+                "delay_level": "0",
+                "confidence": 0.9
             },
             "skill_result": {
                 "optimized_schedule": skill_result.optimized_schedule,
                 "delay_statistics": skill_result.delay_statistics,
                 "computation_time": skill_result.computation_time
             },
-            "eval_result": {
-                "proposed_metrics": {
-                    "max_delay_seconds": eval_result.proposed_metrics.max_delay_seconds,
-                    "avg_delay_seconds": eval_result.proposed_metrics.avg_delay_seconds
-                },
-                "baseline_metrics": {
-                    "max_delay_seconds": eval_result.baseline_metrics.max_delay_seconds,
-                    "avg_delay_seconds": eval_result.baseline_metrics.avg_delay_seconds
-                }
-            },
             "original_schedule": original_schedule
         })
-        
+
     except Exception as e:
         return jsonify({
             "success": False,
@@ -961,6 +774,191 @@ def generate_diagram():
             "success": False,
             "message": str(e)
         })
+
+
+@app.route('/api/agent_chat', methods=['POST'])
+def agent_chat():
+    """
+    Qwen Agent 对话API
+    接收自然语言输入，Agent自动识别场景并执行调度
+    """
+    try:
+        data = request.json
+        prompt = data.get('prompt', '')
+
+        if not prompt:
+            return jsonify({
+                "success": False,
+                "message": "请输入调度需求"
+            })
+
+        # 获取Qwen Agent
+        agent = get_qwen_agent()
+        if agent is None:
+            return jsonify({
+                "success": False,
+                "message": "Qwen Agent未初始化，请检查模型配置"
+            })
+
+        # 解析用户输入，构建DelayInjection
+        # 尝试从输入中提取场景信息
+        delay_injection = parse_user_prompt(prompt)
+
+        # 调用Agent分析
+        result = agent.analyze(delay_injection)
+
+        if result.success and result.dispatch_result:
+            dispatch = result.dispatch_result
+
+            # 获取原始时刻表
+            original_schedule = get_original_schedule()
+
+            return jsonify({
+                "success": True,
+                "recognized_scenario": result.recognized_scenario,
+                "selected_skill": result.selected_skill,
+                "reasoning": result.reasoning,
+                "delay_statistics": dispatch.delay_statistics,
+                "message": dispatch.message,
+                "computation_time": result.computation_time,
+                "optimized_schedule": dispatch.optimized_schedule,
+                "original_schedule": original_schedule
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "message": result.error_message or "Agent执行失败"
+            })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "message": str(e)
+        })
+
+
+@app.route('/api/general_chat', methods=['POST'])
+def general_chat():
+    """
+    通用对话API - 不强制Tool调用
+    用于回答关于系统的一般问题
+    """
+    try:
+        data = request.json
+        prompt = data.get('prompt', '')
+
+        if not prompt:
+            return jsonify({
+                "success": False,
+                "message": "请输入问题"
+            })
+
+        # 获取Qwen Agent
+        agent = get_qwen_agent()
+        if agent is None:
+            return jsonify({
+                "success": False,
+                "message": "Qwen Agent未初始化"
+            })
+
+        # 构建通用对话Prompt（不包含Tools，自由的对话）
+        general_prompt = f"""你是一个友好的铁路调度助手。请用通俗易懂的语言回答用户的问题。
+
+用户问题: {prompt}
+
+回答要求：
+- 简洁明了
+- 如果是技术术语，请简单解释
+- 如果不知道，请如实说明"""
+
+        # 调用模型（不使用Tool）
+        messages = [
+            {"role": "system", "content": "你是一个友好、专业的铁路调度助手。"},
+            {"role": "user", "content": general_prompt}
+        ]
+
+        response = agent.chat_direct(messages)
+
+        return jsonify({
+            "success": True,
+            "response": response
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "message": str(e)
+        })
+
+
+def parse_user_prompt(prompt: str) -> dict:
+    """
+    解析用户输入，构建DelayInjection
+
+    简单规则解析，后续可接入LLM进行语义理解
+    """
+    import re
+
+    prompt_lower = prompt.lower()
+
+    # 检测场景类型
+    if '限速' in prompt:
+        scenario_type = 'temporary_speed_limit'
+    elif '故障' in prompt or '设备故障' in prompt:
+        scenario_type = 'sudden_failure'
+    else:
+        scenario_type = 'temporary_speed_limit'  # 默认
+
+    # 提取列车和延误信息
+    # 匹配格式：G1001延误10分钟，G1003延误15分钟
+    train_pattern = r'([GDCTKZ]\d+)'
+    delay_pattern = r'(\d+)\s*分钟'
+
+    train_ids = re.findall(train_pattern, prompt)
+    delays = re.findall(delay_pattern, prompt)
+
+    # 如果没有提取到，使用默认
+    if not train_ids:
+        train_ids = ['G1001']
+    if not delays:
+        delays = ['600']
+
+    # 构建DelayInjection
+    injected_delays = []
+    for i, train_id in enumerate(train_ids):
+        delay_seconds = int(delays[i]) * 60 if i < len(delays) else 600
+
+        injected_delays.append({
+            "train_id": train_id,
+            "location": {"location_type": "station", "station_code": "TJG"},
+            "initial_delay_seconds": delay_seconds,
+            "timestamp": "2024-01-15T10:00:00Z"
+        })
+
+    # 构建完整的delay_injection
+    if scenario_type == 'temporary_speed_limit':
+        return {
+            "scenario_type": scenario_type,
+            "scenario_id": "AGENT_CHAT_001",
+            "injected_delays": injected_delays,
+            "affected_trains": train_ids,
+            "scenario_params": {
+                "limit_speed_kmh": 200,
+                "duration_minutes": 120,
+                "affected_section": "TJG -> JNZ"
+            }
+        }
+    else:  # sudden_failure
+        return {
+            "scenario_type": scenario_type,
+            "scenario_id": "AGENT_CHAT_001",
+            "injected_delays": injected_delays,
+            "affected_trains": train_ids,
+            "scenario_params": {
+                "failure_type": "vehicle_breakdown",
+                "estimated_repair_time": 60
+            }
+        }
 
 
 if __name__ == '__main__':
